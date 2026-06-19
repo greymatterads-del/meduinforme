@@ -287,6 +287,55 @@
         .budget-bar-wrap { flex:1; min-width:80px; }
         .budget-bar-track { height:5px; background:#e0e0e0; border-radius:3px; overflow:hidden; margin-top:3px; }
         .budget-bar-fill { height:100%; border-radius:3px; transition:width 0.4s ease; }
+
+        /* Galería de imágenes de anuncios */
+        .campaign-images-section { margin-top:8px; padding-top:8px; border-top:1px solid var(--border-color); }
+        .campaign-images-title { font-size:11px; font-weight:700; color:var(--text-secondary); margin-bottom:6px; text-transform:uppercase; }
+        
+        /* Links de imágenes */
+        .image-links-container { display:flex; gap:6px; flex-wrap:wrap; }
+        .image-link-btn {
+            display:inline-block; padding:6px 12px; background:linear-gradient(135deg,#3498db,#2980b9);
+            color:white; text-decoration:none; border-radius:4px; font-size:11px; font-weight:600;
+            transition:all 0.2s ease; box-shadow:0 2px 4px rgba(52,152,219,.3);
+        }
+        .image-link-btn:hover { transform:translateY(-2px); box-shadow:0 4px 8px rgba(52,152,219,.5); }
+        
+        /* Galería antigua (mantenida por compatibilidad) */
+        .campaign-images-gallery {
+            display:flex; gap:6px; flex-wrap:wrap; max-height:120px; overflow-y:auto;
+            padding:4px; background:var(--bg-tertiary); border-radius:4px;
+        }
+        .campaign-image-item {
+            flex-shrink:0; position:relative; overflow:hidden; border-radius:3px;
+            border:1px solid var(--border-color); cursor:pointer; transition:all 0.2s ease;
+        }
+        .campaign-image-item:hover { transform:scale(1.05); box-shadow:0 2px 6px rgba(0,0,0,0.2); }
+        .campaign-image-item img {
+            width:80px; height:80px; object-fit:cover; display:block;
+        }
+        .campaign-image-item.no-image {
+            width:80px; height:80px; display:flex; align-items:center; justify-content:center;
+            background:linear-gradient(135deg,#95a5a6,#7f8c8d); color:white; font-size:9px;
+            font-weight:600; text-align:center; padding:4px;
+        }
+        .image-modal {
+            display:none; position:fixed; top:0; left:0; right:0; bottom:0;
+            background:rgba(0,0,0,0.8); z-index:10000; align-items:center; justify-content:center;
+        }
+        .image-modal.show { display:flex; }
+        .image-modal-content {
+            background:var(--bg-secondary); border-radius:8px; padding:16px; max-width:90%; max-height:90vh;
+            overflow:auto; position:relative;
+        }
+        .image-modal-close {
+            position:absolute; top:8px; right:8px; background:rgba(0,0,0,0.3); color:white;
+            border:none; width:30px; height:30px; border-radius:50%; cursor:pointer; font-size:18px;
+            transition:all 0.2s ease;
+        }
+        .image-modal-close:hover { background:rgba(0,0,0,0.6); }
+        .image-modal-img { max-width:100%; max-height:80vh; border-radius:4px; }
+        .image-modal-info { margin-top:12px; font-size:12px; color:var(--text-secondary); }
     </style>
 </head>
 <body>
@@ -413,24 +462,27 @@ async function fetchCuenta(idCuenta, token) {
         saldos = await apiFetch(`${BASE}/${idCuenta}?fields=spend_cap,amount_spent,balance,name&access_token=${token}`);
     } catch(e) { console.warn('Saldos error', e.message); }
 
-    // 2. Campañas (ACTIVE + PAUSED)
+    // 2. Campañas (ACTIVAS SOLAMENTE - reduce llamadas)
     let campanias = [];
-    let nextUrl = `${BASE}/${idCuenta}/campaigns?fields=id,name,status,daily_budget,lifetime_budget&limit=50&access_token=${token}`;
+    let nextUrl = `${BASE}/${idCuenta}/campaigns?fields=id,name,status,daily_budget,lifetime_budget&limit=100&access_token=${token}`;
     let paginas = 0;
-    while (nextUrl && paginas < 10) {
+    while (nextUrl && paginas < 5) { // Máx 5 páginas
         try {
             const d = await apiFetch(nextUrl);
             paginas++;
-            const filtradas = (d.data || []).filter(c => ['ACTIVE','PAUSED'].includes(c.status));
+            const filtradas = (d.data || []).filter(c => c.status === 'ACTIVE'); // SOLO ACTIVAS
             campanias = campanias.concat(filtradas);
             nextUrl = d.paging?.next || null;
         } catch(e) { console.warn('Campañas error', e.message); break; }
     }
 
-    // 3. Insights del día por campaña
+    // 3. Insights + Adsets en paralelo (solo para campañas activas)
     const campaniasFull = await Promise.all(campanias.map(async (camp) => {
         let spend = 0, messages = 0;
+        let adsets = [];
+        
         try {
+            // OPTIMIZACIÓN: Traer insights con status en una sola llamada
             const ins = await apiFetch(
                 `${BASE}/${camp.id}/insights?fields=spend,actions&time_range={"since":"${hoy}","until":"${hoy}"}&access_token=${token}`
             );
@@ -444,27 +496,64 @@ async function fetchCuenta(idCuenta, token) {
             }
         } catch(e) { /* sin insights hoy */ }
 
-        // 4. Adsets del día
-        let adsets = [];
-        try {
-            const ads = await apiFetch(
-                `${BASE}/${camp.id}/adsets?fields=id,name,status,daily_budget,lifetime_budget,insights.time_range({"since":"${hoy}","until":"${hoy}"}).fields(spend,actions)&access_token=${token}`
-            );
-            adsets = (ads.data || []).map(a => {
-                const actions = a.insights?.data?.[0]?.actions || [];
-                const res = actions
-                    .filter(x => x.action_type === 'onsite_conversion.total_messaging_connection')
-                    .reduce((s,x) => s + Number(x.value||0), 0);
-                const gs = parseFloat(a.insights?.data?.[0]?.spend || 0);
-                return {
-                    id: a.id, nombre: a.name, status: a.status,
-                    gasto: gs, resultados: res,
-                    costo: res > 0 ? gs/res : 0,
-                    daily_budget: a.daily_budget,
-                    lifetime_budget: a.lifetime_budget
-                };
-            });
-        } catch(e) { /* sin adsets */ }
+        // OPTIMIZACIÓN: Solo pedir adsets si hay gasto
+        if (spend > 0) {
+            try {
+                const adsetsRes = await apiFetch(
+                    `${BASE}/${camp.id}/adsets?fields=id,name,status,daily_budget,lifetime_budget,insights.time_range({"since":"${hoy}","until":"${hoy}"}).fields(spend,actions)&limit=100&access_token=${token}`
+                );
+                
+                adsets = await Promise.all((adsetsRes.data || [])
+                    .filter(a => a.status === 'ACTIVE') // SOLO ADSETS ACTIVOS
+                    .map(async (a) => {
+                        const actions = a.insights?.data?.[0]?.actions || [];
+                        const res = actions
+                            .filter(x => x.action_type === 'onsite_conversion.total_messaging_connection')
+                            .reduce((s,x) => s + Number(x.value||0), 0);
+                        const gs = parseFloat(a.insights?.data?.[0]?.spend || 0);
+                        
+                        // OPTIMIZACIÓN: Solo pedir anuncios si adset tiene gasto
+                        let anuncios = [];
+                        if (gs > 0) {
+                            try {
+                                const adsInAdset = await apiFetch(
+                                    `${BASE}/${a.id}/ads?fields=id,name,status,creative{image_url,thumbnail_url},insights.time_range({"since":"${hoy}","until":"${hoy}"}).fields(spend,actions)&limit=100&access_token=${token}`
+                                );
+                                anuncios = (adsInAdset.data || [])
+                                    .filter(ad => ad.status === 'ACTIVE') // SOLO ANUNCIOS ACTIVOS
+                                    .map(ad => {
+                                        const adActions = ad.insights?.data?.[0]?.actions || [];
+                                        const adRes = adActions
+                                            .filter(x => x.action_type === 'onsite_conversion.total_messaging_connection')
+                                            .reduce((s,x) => s + Number(x.value||0), 0);
+                                        const adGasto = parseFloat(ad.insights?.data?.[0]?.spend || 0);
+                                        return {
+                                            id: ad.id,
+                                            nombre: ad.name,
+                                            status: ad.status,
+                                            gasto: adGasto,
+                                            resultados: adRes,
+                                            cpm: adRes > 0 ? adGasto/adRes : 0,
+                                            imagen: ad.creative?.image_url || ad.creative?.thumbnail_url || null
+                                        };
+                                    });
+                            } catch(e) { /* sin anuncios */ }
+                        }
+                        
+                        return {
+                            id: a.id,
+                            nombre: a.name,
+                            status: a.status,
+                            gasto: gs,
+                            resultados: res,
+                            cpm: res > 0 ? gs/res : 0,
+                            daily_budget: a.daily_budget,
+                            lifetime_budget: a.lifetime_budget,
+                            anuncios
+                        };
+                    }));
+            } catch(e) { /* sin adsets */ }
+        }
 
         const cpm = messages > 0 ? spend / messages : 0;
         return { ...camp, spend, messages, cpm, adsets };
@@ -474,12 +563,22 @@ async function fetchCuenta(idCuenta, token) {
 }
 
 // ============================================================
-// TOGGLE ON/OFF
+// TOGGLE ON/OFF - CAMPAÑAS
 // ============================================================
-async function toggleCampania(campId, estadoActual, token, btnEl) {
+async function toggleCampania(e) {
+    if (!e || !e.target) return;
+    
+    const btn = e.target.closest('.toggle-btn[data-camp-id]');
+    if (!btn) return;
+    
+    const campId = btn.getAttribute('data-camp-id');
+    const estadoActual = btn.getAttribute('data-estado');
+    const token = btn.getAttribute('data-token');
+    
     const nuevoEstado = estadoActual === 'ACTIVE' ? 'PAUSED' : 'ACTIVE';
-    btnEl.disabled = true;
-    btnEl.textContent = '⏳';
+    btn.disabled = true;
+    btn.textContent = '⏳';
+    
     try {
         const formData = new FormData();
         formData.append('status', nuevoEstado);
@@ -489,51 +588,108 @@ async function toggleCampania(campId, estadoActual, token, btnEl) {
         const d = await r.json();
         if (d.error) throw new Error(d.error.message);
 
-        // Actualizar UI inmediatamente
-        const barEl = btnEl.closest('.campaign-bar');
-        const isPaused = nuevoEstado === 'PAUSED';
-        btnEl.textContent = isPaused ? '▶ ACTIVAR' : '⏸ PAUSAR';
-        btnEl.className = 'toggle-btn ' + (isPaused ? 'paused' : 'active');
-        btnEl.setAttribute('data-estado', nuevoEstado);
+        btn.setAttribute('data-estado', nuevoEstado);
+        btn.className = 'toggle-btn ' + (nuevoEstado === 'PAUSED' ? 'paused' : 'active');
+        btn.textContent = nuevoEstado === 'PAUSED' ? '⏸ PAUSAR' : '▶ ACTIVAR';
 
-        // Cambiar estilo de la barra
-        if (barEl) {
-            if (isPaused) {
-                barEl.classList.add('campaign-bar-paused');
-                ['campania-fondo-azul','campania-fondo-verde','campania-fondo-amarillo','campania-fondo-rojo']
-                    .forEach(c => barEl.classList.remove(c));
-            } else {
-                barEl.classList.remove('campaign-bar-paused');
-            }
-        }
-
-        // Actualizar badge de estado
-        const estadoBadge = barEl?.querySelector('.estado-badge');
-        if (estadoBadge) {
-            estadoBadge.textContent = isPaused ? 'PAUSADA' : 'ACTIVA';
-            estadoBadge.className = 'campaign-stat-value estado-badge ' + (isPaused ? 'estado-pausado' : 'estado-activo');
-        }
-
-        showToast(isPaused ? `⏸ "${campId}" pausada` : `▶ "${campId}" activada`);
+        showToast(nuevoEstado === 'PAUSED' ? `⏸ Campaña pausada` : `▶ Campaña activada`);
     } catch(e) {
         showToast('❌ Error: ' + e.message, 'error');
-        btnEl.textContent = estadoActual === 'ACTIVE' ? '⏸ PAUSAR' : '▶ ACTIVAR';
+        btn.textContent = estadoActual === 'ACTIVE' ? '⏸ PAUSAR' : '▶ ACTIVAR';
     } finally {
-        btnEl.disabled = false;
+        btn.disabled = false;
     }
 }
 
-// Delegación de eventos para toggles
+// Delegación de eventos para toggles campañas
 document.addEventListener('click', (e) => {
-    const btn = e.target.closest('.toggle-btn');
-    if (!btn) return;
-    const campId = btn.getAttribute('data-camp-id');
-    const estado = btn.getAttribute('data-estado');
-    const token  = btn.getAttribute('data-token');
-    if (campId && estado && token) toggleCampania(campId, estado, token, btn);
+    if (e.target.closest('.toggle-btn[data-camp-id]') && !e.target.closest('.toggle-btn[data-adset-id]') && !e.target.closest('.toggle-btn[data-ad-id]')) {
+        const btn = e.target.closest('.toggle-btn[data-camp-id]');
+        const campId = btn.getAttribute('data-camp-id');
+        const estado = btn.getAttribute('data-estado');
+        const token = btn.getAttribute('data-token');
+        if (campId && estado && token) toggleCampania(event);
+    }
 });
 
-// Toggle adsets
+// Toggle expandir
+function toggleExpand(id) {
+    const el = document.getElementById(id);
+    const icon = document.getElementById('icon-' + id);
+    if (el.style.display === 'none') {
+        el.style.display = 'block';
+        icon.textContent = '▼';
+    } else {
+        el.style.display = 'none';
+        icon.textContent = '▶';
+    }
+}
+
+// Toggle Adset
+async function toggleAdset(e) {
+    e.stopPropagation();
+    const btn = e.target;
+    const adsetId = btn.getAttribute('data-adset-id');
+    const estado = btn.getAttribute('data-estado');
+    const token = btn.getAttribute('data-token');
+    
+    const nuevoEstado = estado === 'ACTIVE' ? 'PAUSED' : 'ACTIVE';
+    btn.disabled = true;
+    
+    try {
+        const formData = new FormData();
+        formData.append('status', nuevoEstado);
+        formData.append('access_token', token);
+        
+        const r = await fetch(`${BASE}/${adsetId}`, { method: 'POST', body: formData });
+        const d = await r.json();
+        if (d.error) throw new Error(d.error.message);
+        
+        btn.setAttribute('data-estado', nuevoEstado);
+        btn.className = 'toggle-btn ' + (nuevoEstado === 'PAUSED' ? 'paused' : 'active');
+        btn.textContent = nuevoEstado === 'PAUSED' ? '▶ Act.' : '⏸ Pau.';
+        
+        showToast(nuevoEstado === 'PAUSED' ? `⏸ Adset pausado` : `▶ Adset activado`);
+    } catch(e) {
+        showToast('❌ Error: ' + e.message, 'error');
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+// Toggle Anuncio
+async function toggleAnuncio(e) {
+    e.stopPropagation();
+    const btn = e.target;
+    const adId = btn.getAttribute('data-ad-id');
+    const estado = btn.getAttribute('data-estado');
+    const token = btn.getAttribute('data-token');
+    
+    const nuevoEstado = estado === 'ACTIVE' ? 'PAUSED' : 'ACTIVE';
+    btn.disabled = true;
+    
+    try {
+        const formData = new FormData();
+        formData.append('status', nuevoEstado);
+        formData.append('access_token', token);
+        
+        const r = await fetch(`${BASE}/${adId}`, { method: 'POST', body: formData });
+        const d = await r.json();
+        if (d.error) throw new Error(d.error.message);
+        
+        btn.setAttribute('data-estado', nuevoEstado);
+        btn.className = 'toggle-btn ' + (nuevoEstado === 'PAUSED' ? 'paused' : 'active');
+        btn.textContent = nuevoEstado === 'PAUSED' ? '▶ Act.' : '⏸ Pau.';
+        
+        showToast(nuevoEstado === 'PAUSED' ? `⏸ Anuncio pausado` : `▶ Anuncio activado`);
+    } catch(e) {
+        showToast('❌ Error: ' + e.message, 'error');
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+// Toggle adsets (antiguo - mantener para compatibilidad)
 document.addEventListener('click', (e) => {
     const btn = e.target.closest('.btn-toggle-adsets');
     if (!btn) return;
@@ -544,89 +700,124 @@ document.addEventListener('click', (e) => {
     btn.textContent = open ? '▲ Adsets' : '▼ Adsets';
 });
 
-// ============================================================
-// RENDER
-// ============================================================
-function renderCampania(camp, token) {
-    const isPaused = camp.status !== 'ACTIVE';
-    const pausedClass = isPaused ? 'campaign-bar-paused' : bgClass(camp.cpm);
-    const cpmStr = camp.cpm.toFixed(2);
-    const adsetsId = 'adsets-' + camp.id;
-
-    // Budget bar
-    let budgetHtml = '';
-    const budgetVal = parseInt(camp.daily_budget || camp.lifetime_budget || 0) / 100;
-    if (budgetVal > 0 && camp.spend > 0) {
-        const pct = Math.min(100, (camp.spend / budgetVal) * 100).toFixed(0);
-        const barColor = pct >= 90 ? '#e74c3c' : pct >= 70 ? '#f39c12' : '#27ae60';
-        budgetHtml = `
-            <div class="campaign-stat-item budget-bar-wrap" title="Gasto ${pct}% del presupuesto">
-                <span class="campaign-stat-label">Presupuesto</span>
-                <div class="budget-bar-track">
-                    <div class="budget-bar-fill" style="width:${pct}%;background:${barColor}"></div>
-                </div>
-                <span class="campaign-stat-value" style="font-size:9px">${pct}%</span>
-            </div>`;
-    }
-
-    // Adsets
-    let adsetsBtn = '', adsetsHtml = '';
-    if (camp.adsets && camp.adsets.length > 0) {
-        adsetsBtn = `<div class="campaign-stat-item"><button class="btn-toggle-adsets" data-target="${adsetsId}">▼ Adsets</button></div>`;
-        const rows = camp.adsets.map(a => `
-            <div class="adset-row">
-                <span class="adset-name">${a.nombre}</span>
-                <div class="adset-stat"><span class="adset-stat-label">Gasto</span><span class="adset-stat-value">${fmt$(a.gasto)}</span></div>
-                <div class="adset-stat"><span class="adset-stat-label">Msgs</span><span class="adset-stat-value">${a.resultados}</span></div>
-                <div class="adset-stat"><span class="adset-stat-label">CPM</span><span class="adset-stat-value">${fmt$(a.costo)}</span></div>
-                <span class="campaign-stat-value ${a.status === 'ACTIVE' ? 'estado-activo' : 'estado-pausado'}" style="font-size:9px">${a.status === 'ACTIVE' ? '✓ ACTIVO' : '⏸ PAUSADO'}</span>
-            </div>`).join('');
-        adsetsHtml = `<div id="${adsetsId}" class="adsets-container">${rows}</div>`;
-    }
-
-    return `
-        <div class="campaign-bar ${pausedClass}">
-            <span class="campaign-bar-name">${camp.name}</span>
-            <div class="campaign-bar-stats">
-                <div class="campaign-stat-item">
-                    <span class="campaign-stat-label">Gasto</span>
-                    <span class="campaign-stat-value">${fmt$(camp.spend)}</span>
-                </div>
-                <div class="campaign-stat-item">
-                    <span class="campaign-stat-label">Msgs</span>
-                    <span class="campaign-stat-value">${camp.messages}</span>
-                </div>
-                <div class="campaign-stat-item ${colorClass(camp.cpm)}">
-                    <span class="campaign-stat-label">$/Msg</span>
-                    <span class="campaign-stat-value">$${cpmStr}</span>
-                </div>
-                ${budgetHtml}
-                <div class="campaign-stat-item">
-                    <span class="campaign-stat-label">Estado</span>
-                    <span class="campaign-stat-value estado-badge ${isPaused ? 'estado-pausado' : 'estado-activo'}">${isPaused ? 'PAUSADA' : 'ACTIVA'}</span>
-                </div>
-                ${adsetsBtn}
-                <div class="campaign-stat-item">
-                    <button class="toggle-btn ${isPaused ? 'paused' : 'active'}"
-                        data-camp-id="${camp.id}"
-                        data-estado="${camp.status}"
-                        data-token="${token}">
-                        ${isPaused ? '▶ ACTIVAR' : '⏸ PAUSAR'}
-                    </button>
-                </div>
+// Modal de imágenes
+function abrirImagenModal(url, nombre) {
+    const modal = document.createElement('div');
+    modal.className = 'image-modal show';
+    modal.innerHTML = `
+        <div class="image-modal-content">
+            <button class="image-modal-close" onclick="this.closest('.image-modal').remove()">✕</button>
+            <img src="${url}" alt="${nombre}" class="image-modal-img" />
+            <div class="image-modal-info">
+                <strong>${nombre}</strong><br>
+                <small>${url}</small>
             </div>
         </div>
-        ${adsetsHtml}
+    `;
+    document.body.appendChild(modal);
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) modal.remove();
+    });
+}
+
+// ============================================================
+// RENDER - INTERFAZ EN CASCADA
+// ============================================================
+function renderAnuncio(anuncio, adsetId, token) {
+    const isPaused = anuncio.status !== 'ACTIVE';
+    const imgHtml = anuncio.imagen 
+        ? `<img src="${anuncio.imagen}" alt="Anuncio" style="width:50px;height:50px;object-fit:cover;border-radius:3px;margin-right:6px;">`
+        : '';
+    
+    return `
+        <div style="background:var(--bg-tertiary);padding:6px 10px;margin:4px 0;border-radius:3px;border-left:3px solid ${isPaused ? '#95a5a6' : '#27ae60'};display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px;">
+            <div style="display:flex;align-items:center;">
+                ${imgHtml}
+                <div style="font-size:11px;color:var(--text-primary);font-weight:600;flex:1;">${anuncio.nombre}</div>
+            </div>
+            <div style="display:flex;gap:4px;align-items:center;font-size:10px;">
+                <span style="background:${isPaused ? '#e74c3c' : '#27ae60'};color:white;padding:2px 6px;border-radius:3px;font-weight:600;">${isPaused ? 'PAUSADO' : 'ACTIVO'}</span>
+                <span>$${anuncio.gasto.toFixed(2)}</span>
+                <span>${anuncio.resultados} msgs</span>
+                <span>💵 $${anuncio.cpm.toFixed(2)}/msg</span>
+                <button class="toggle-btn ${isPaused ? 'paused' : 'active'}" data-ad-id="${anuncio.id}" data-adset-id="${adsetId}" data-estado="${anuncio.status}" data-token="${token}" style="padding:2px 8px;font-size:9px;" onclick="toggleAnuncio(event)">${isPaused ? '▶ Act.' : '⏸ Pau.'}</button>
+            </div>
+        </div>
+    `;
+}
+
+function renderAdset(adset, campId, token) {
+    const expandId = 'expand-adset-' + adset.id;
+    const isPaused = adset.status !== 'ACTIVE';
+    
+    // Filtrar anuncios: solo con gasto O activos
+    const anunciosFiltrados = adset.anuncios.filter(a => a.gasto > 0 || a.status === 'ACTIVE');
+    
+    return `
+        <div style="background:var(--bg-secondary);padding:8px;margin:8px 0;border-left:4px solid ${isPaused ? '#95a5a6' : '#3498db'};border-radius:3px;">
+            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px;cursor:pointer;" onclick="toggleExpand('${expandId}')">
+                <div style="display:flex;align-items:center;gap:6px;">
+                    <span id="icon-${expandId}" style="font-size:14px;">▶</span>
+                    <div>
+                        <div style="font-size:12px;font-weight:700;color:var(--text-primary);">${adset.nombre}</div>
+                        <div style="font-size:10px;color:var(--text-secondary);">Adset • ${anunciosFiltrados.length} anuncios</div>
+                    </div>
+                </div>
+                <div style="display:flex;gap:4px;align-items:center;font-size:10px;">
+                    <span style="background:${isPaused ? '#e74c3c' : '#3498db'};color:white;padding:2px 6px;border-radius:3px;font-weight:600;">${isPaused ? 'PAUSADO' : 'ACTIVO'}</span>
+                    <span>$${adset.gasto.toFixed(2)}</span>
+                    <span>${adset.resultados} msgs</span>
+                    <span>💵 $${adset.cpm.toFixed(2)}/msg</span>
+                    <button class="toggle-btn ${isPaused ? 'paused' : 'active'}" data-adset-id="${adset.id}" data-camp-id="${campId}" data-estado="${adset.status}" data-token="${token}" style="padding:2px 8px;font-size:9px;" onclick="toggleAdset(event)">${isPaused ? '▶ Act.' : '⏸ Pau.'}</button>
+                </div>
+            </div>
+            <div id="${expandId}" style="display:none;margin-top:8px;padding-left:12px;border-left:2px solid var(--border-color);">
+                ${anunciosFiltrados.map(a => renderAnuncio(a, adset.id, token)).join('')}
+            </div>
+        </div>
+    `;
+}
+
+function renderCampania(camp, token) {
+    const expandId = 'expand-camp-' + camp.id;
+    const isPaused = camp.status !== 'ACTIVE';
+    
+    // Filtrar adsets: solo con gasto O activos (pero ahora fetchCuenta solo trae ACTIVAS)
+    const adsetsFiltrados = camp.adsets.filter(a => a.gasto > 0 || a.status === 'ACTIVE');
+    
+    return `
+        <div style="background:var(--bg-secondary);padding:10px;margin:10px 0;border-left:5px solid ${isPaused ? '#95a5a6' : '#27ae60'};border-radius:4px;box-shadow:0 1px 3px var(--shadow-light);">
+            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px;cursor:pointer;" onclick="toggleExpand('${expandId}')">
+                <div style="display:flex;align-items:center;gap:6px;">
+                    <span id="icon-${expandId}" style="font-size:16px;">▶</span>
+                    <div>
+                        <div style="font-size:13px;font-weight:700;color:var(--text-primary);">${camp.name}</div>
+                        <div style="font-size:10px;color:var(--text-secondary);">Campaña • ${adsetsFiltrados.length} adsets</div>
+                    </div>
+                </div>
+                <div style="display:flex;gap:6px;align-items:center;font-size:11px;">
+                    <span style="background:${isPaused ? '#e74c3c' : '#27ae60'};color:white;padding:3px 8px;border-radius:3px;font-weight:600;">${isPaused ? 'PAUSADA' : 'ACTIVA'}</span>
+                    <span>💰 $${camp.spend.toFixed(2)}</span>
+                    <span>📨 ${camp.messages}</span>
+                    <span>💵 $${camp.cpm.toFixed(2)}/msg</span>
+                    <button class="toggle-btn ${isPaused ? 'paused' : 'active'}" data-camp-id="${camp.id}" data-estado="${camp.status}" data-token="${token}" style="padding:3px 10px;font-size:10px;" onclick="toggleCampania(event)">${isPaused ? '▶ ACTIVAR' : '⏸ PAUSAR'}</button>
+                </div>
+            </div>
+            <div id="${expandId}" style="display:none;margin-top:10px;padding-left:12px;border-left:2px solid var(--border-color);">
+                ${adsetsFiltrados.map(a => renderAdset(a, camp.id, token)).join('')}
+            </div>
+        </div>
     `;
 }
 
 function renderCuenta(cuenta, token, nombreUsuario) {
     const campanias = cuenta.campanias || [];
-    const activas = campanias.filter(c => c.status === 'ACTIVE');
-    const pausadas = campanias.filter(c => c.status === 'PAUSED');
+    
+    // Filtrar: solo campañas con gasto O activas
+    const campaniasFiltradas = campanias.filter(c => c.spend > 0 || c.status === 'ACTIVE');
 
     let totalGasto = 0, totalMsgs = 0;
-    campanias.forEach(c => { totalGasto += c.spend; totalMsgs += c.messages; });
+    campaniasFiltradas.forEach(c => { totalGasto += c.spend; totalMsgs += c.messages; });
 
     const cpmProm = totalMsgs > 0 ? totalGasto / totalMsgs : 0;
     const claseTotal = progresoClass(totalMsgs > 0 ? 100 : 0);
@@ -639,9 +830,12 @@ function renderCuenta(cuenta, token, nombreUsuario) {
         ? `<div class="panel-info-row"><span class="panel-info-label">Saldo</span><span class="panel-info-value" style="color:#27ae60">${fmtMoneda(saldo)}</span></div>`
         : '';
 
-    const barrasHtml = campanias.length > 0
-        ? campanias.map(c => renderCampania(c, token)).join('')
-        : '<div style="padding:10px;color:var(--text-secondary);font-size:13px">Sin campañas activas o pausadas</div>';
+    const campaniaActivas = campaniasFiltradas.filter(c => c.status === 'ACTIVE').length;
+    const campaniaPausadas = campaniasFiltradas.filter(c => c.status === 'PAUSED').length;
+
+    const barrasHtml = campaniasFiltradas.length > 0
+        ? campaniasFiltradas.map(c => renderCampania(c, token)).join('')
+        : '<div style="padding:10px;color:var(--text-secondary);font-size:13px">✓ Sin campañas con gasto o activas</div>';
 
     return `
         <div class="panel-section">
@@ -653,9 +847,9 @@ function renderCuenta(cuenta, token, nombreUsuario) {
                 </div>
                 <div class="panel-info-row">
                     <span class="panel-info-label">Activas</span>
-                    <span class="panel-info-value" style="color:#27ae60">${activas.length}</span>
+                    <span class="panel-info-value" style="color:#27ae60">${campaniaActivas}</span>
                     <span class="panel-info-label">Pausadas</span>
-                    <span class="panel-info-value" style="color:#e74c3c">${pausadas.length}</span>
+                    <span class="panel-info-value" style="color:#e74c3c">${campaniaPausadas}</span>
                 </div>
                 ${saldoHtml}
                 <div class="panel-info-row">
